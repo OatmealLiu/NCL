@@ -5,18 +5,20 @@ from torch.optim import SGD, lr_scheduler
 from sklearn.metrics.cluster import normalized_mutual_info_score as nmi_score
 from sklearn.metrics import adjusted_rand_score as ari_score
 from sklearn.cluster import KMeans, DBSCAN
-from utils.util import BCE, PairEnum, cluster_acc, Identity, AverageMeter, seed_torch, BCE_softlabels
+from utils.util import BCE, PairEnum, Identity, AverageMeter, seed_torch, BCE_softlabels
 from utils import ramps 
 from models.resnet import ResNet, BasicBlock
 from data.cifarloader import CIFAR10Loader, CIFAR10LoaderMix, CIFAR100Loader, CIFAR100LoaderMix
-from data.svhnloader import SVHNLoader, SVHNLoaderMix
+from data.tinyimagenetloader import TinyImageNetLoader
 from tqdm import tqdm
 import numpy as np
 import os
 from models.NCL import NCLMemory
+import wandb
+from utils.fair_evals import fair_test, cluster_acc
 
 
-def train(model, train_loader, unlabeled_eval_loader, args):
+def train(model, train_loader, unlabeled_eval_loader, labeled_eval_loader, all_eval_loader, args):
     print ('Start Neighborhood Contrastive Learning:')
     optimizer = SGD(model.parameters(), lr=args.lr, momentum=args.momentum, weight_decay=args.weight_decay)
     exp_lr_scheduler = lr_scheduler.StepLR(optimizer, step_size=args.step_size, gamma=args.gamma)
@@ -35,14 +37,16 @@ def train(model, train_loader, unlabeled_eval_loader, args):
             idx = idx.to(device)
 
             mask_lb = label < args.num_labeled_classes
+            # print(mask_lb)
 
             feat, feat_q, output1, output2 = model(x, 'feat_logit')
             feat_bar, feat_k, output1_bar, output2_bar = model(x_bar, 'feat_logit')
 
             prob1, prob1_bar, prob2, prob2_bar = F.softmax(output1, dim=1), F.softmax(output1_bar, dim=1), F.softmax(
                 output2, dim=1), F.softmax(output2_bar, dim=1)
-
+            print(feat.shape)
             rank_feat = (feat[~mask_lb]).detach()
+            print(rank_feat.shape)
             if args.bce_type == 'cos':
                 # default: cosine similarity with threshold
                 feat_row, feat_col = PairEnum(F.normalize(rank_feat, dim=1))
@@ -69,17 +73,40 @@ def train(model, train_loader, unlabeled_eval_loader, args):
             loss_ce = criterion1(output1[mask_lb], label[mask_lb])
             loss_bce = criterion2(prob1_ulb, prob2_ulb, target_ulb)
             consistency_loss = F.mse_loss(prob1, prob1_bar) + F.mse_loss(prob2, prob2_bar)
-            loss = loss_ce + loss_bce + w * consistency_loss
+            # print("loss_ce={}, loss_bce={}, consistency_loss={}".format(loss_ce,loss_bce,consistency_loss))
+            loss = 0.
+            if loss_ce==loss_ce:
+                # print("------>>>>{}".format(loss_ce))
+                loss += loss_ce
+            if loss_bce==loss_bce:
+                loss += loss_bce
+            if consistency_loss==loss_bce:
+                loss += w * consistency_loss
+            # loss = loss_ce + loss_bce + w * consistency_loss
 
             # NCL loss for unlabeled data
-            loss_ncl_ulb = ncl_ulb(feat_q[~mask_lb], feat_k[~mask_lb], label[~mask_lb], epoch, False, ncl_la.memory.clone().detach())
+            # print("feat_q[~mask_lb].shape={}\t\tfeat_k[~mask_lb].shape={}".format(feat_q[~mask_lb].shape, feat_k[~mask_lb].shape))
+            if feat_q[~mask_lb].shape[0] == 0 or feat_k[~mask_lb].shape[0] == 0:
+                loss_ncl_ulb = 0
+            else:
+                loss_ncl_ulb = ncl_ulb(feat_q[~mask_lb], feat_k[~mask_lb], label[~mask_lb], epoch, False, ncl_la.memory.clone().detach())
 
             # NCL loss for labeled data
-            loss_ncl_la = ncl_la(feat_q[mask_lb], feat_k[mask_lb], label[mask_lb], epoch, True)
+            # print("feat_q[mask_lb].shape={}\t\tfeat_k[mask_lb].shape={}".format(feat_q[mask_lb].shape, feat_k[mask_lb].shape))
+            if feat_q[mask_lb].shape[0] == 0 or feat_k[mask_lb].shape[0] == 0:
+                loss_ncl_la = 0
+            else:
+                loss_ncl_la = ncl_la(feat_q[mask_lb], feat_k[mask_lb], label[mask_lb], epoch, True)
 
             if epoch > 0:
+                # print("loss += loss({}) + loss_ncl_ulb({}) * {} + loss_ncl_la({}) * {}".format(
+                #     loss, loss_ncl_ulb, args.w_ncl_ulb, loss_ncl_la, args.w_ncl_la
+                # ))
                 loss += loss_ncl_ulb * args.w_ncl_ulb + loss_ncl_la * args.w_ncl_la
             else:
+                # print("loss += loss({}) + loss_ncl_la({}) * {}".format(
+                #     loss, loss_ncl_la, args.w_ncl_la
+                # ))
                 loss += loss_ncl_la * args.w_ncl_la
 
             # ===================backward=====================
@@ -88,10 +115,43 @@ def train(model, train_loader, unlabeled_eval_loader, args):
             loss.backward()
             optimizer.step()
 
-        args.head = 'head2'
+        # wandb loss logging
+        wandb.log({"loss/total_loss": loss_record.avg}, step=epoch)
         print('Train Epoch: {} Avg Loss: {:.4f}'.format(epoch, loss_record.avg))
+
+        args.head = 'head2'
         print('test on unlabeled classes')
-        test(model, unlabeled_eval_loader, args)
+        NCL_acc_ul = test(model, unlabeled_eval_loader, args)
+
+        # validation for unlabeled data with Backbone(on-the-fly) + head-2(on-the-fly)
+        print('Head2: test on unlabeled classes')
+        args.head = 'head2'
+        acc_head2_ul, ind = fair_test(model, unlabeled_eval_loader, args, return_ind=True)
+
+        # validation for labeled data with Backbone(on-the-fly) + head-1(frozen)
+        print('Joint Head1: test on labeled classes')
+        args.head = 'head1'
+        acc_head1_lb = fair_test(model, labeled_eval_loader, args, cluster=False)
+
+        # validation for unlabeled data with Backbone(on-the-fly) + head-1(frozen)
+        print('Joint Head1: test on unlabeled classes')
+        acc_head1_ul = fair_test(model, unlabeled_eval_loader, args, cluster=False, ind=ind)
+
+        print('Joint Head1: test on all classes w/o clustering')
+        acc_head1_all_wo_cluster = fair_test(model, all_eval_loader, args, cluster=False, ind=ind)
+
+        print('Joint Head1: test on all classes w/ clustering')
+        acc_head1_all_w_cluster = fair_test(model, all_eval_loader, args, cluster=True)
+
+        # wandb metrics logging
+        wandb.log({
+            "val_acc/NCL_ul": NCL_acc_ul,
+            "val_acc/head2_ul": acc_head2_ul,
+            "val_acc/head1_lb": acc_head1_lb,
+            "val_acc/head1_ul": acc_head1_ul,
+            "val_acc/head1_all_wo_clutering": acc_head1_all_wo_cluster,
+            "val_acc/head1_all_w_clustering": acc_head1_all_w_cluster
+        }, step=epoch)
 
 
 def test(model, test_loader, args):
@@ -110,6 +170,7 @@ def test(model, test_loader, args):
         preds = np.append(preds, pred.cpu().numpy())
     acc, nmi, ari = cluster_acc(targets.astype(int), preds.astype(int)), nmi_score(targets, preds), ari_score(targets, preds)
     print('Test acc {:.4f}, nmi {:.4f}, ari {:.4f}'.format(acc, nmi, ari))
+    return acc
 
 
 if __name__ == "__main__":
@@ -133,7 +194,7 @@ if __name__ == "__main__":
     parser.add_argument('--warmup_model_dir', type=str, default='./data/experiments/pretrained/auto_novel/resnet_rotnet_cifar10.pth')
     parser.add_argument('--topk', default=5, type=int)
     parser.add_argument('--model_name', type=str, default='resnet')
-    parser.add_argument('--dataset_name', type=str, default='cifar10', help='options: cifar10, cifar100')
+    parser.add_argument('--dataset_name', type=str, default='cifar10', help='options: cifar10, cifar100, tinyimagenet')
     parser.add_argument('--seed', default=0, type=int)
     parser.add_argument('--mode', type=str, default='train')
     parser.add_argument('--bce_type', type=str, default='cos')
@@ -147,9 +208,12 @@ if __name__ == "__main__":
     parser.add_argument('--w_pos', type=float, default=0.2)
     parser.add_argument('--hard_iter', type=int, default=5)
     parser.add_argument('--num_hard', type=int, default=400)
+    parser.add_argument('--wandb_mode', type=str, default='online', choices=['online', 'offline', 'disabled'])
+    parser.add_argument('--wandb_entity', type=str, default='unitn-mhug')
 
     args = parser.parse_args()
     args.cuda = torch.cuda.is_available()
+    args.device = torch.device("cuda" if args.cuda else "cpu")
     device = torch.device("cuda" if args.cuda else "cpu")
     torch.backends.cudnn.benchmark = True
     seed_torch(args.seed)
@@ -190,36 +254,80 @@ if __name__ == "__main__":
             if 'head' not in name and 'layer4' not in name:
                 param.requires_grad = False
 
+    # WandB setting
+    # use wandb logging
+    wandb_run_name = args.model_name + '_NCL_supervised_' + str(args.seed)
+    wandb.init(project='incd_dev_miu',
+               entity=args.wandb_entity,
+               name=wandb_run_name,
+               mode=args.wandb_mode)
+
     if args.dataset_name == 'cifar10':
         mix_train_loader = CIFAR10LoaderMix(root=args.dataset_root, batch_size=args.batch_size, split='train', aug='twice', shuffle=True, labeled_list=range(args.num_labeled_classes), unlabeled_list=range(args.num_labeled_classes, num_classes))
         unlabeled_eval_loader = CIFAR10Loader(root=args.dataset_root, batch_size=args.batch_size, split='train', aug=None, shuffle=False, target_list = range(args.num_labeled_classes, num_classes))
         unlabeled_eval_loader_test = CIFAR10Loader(root=args.dataset_root, batch_size=args.batch_size, split='test', aug=None, shuffle=False, target_list = range(args.num_labeled_classes, num_classes))
         labeled_eval_loader = CIFAR10Loader(root=args.dataset_root, batch_size=args.batch_size, split='test', aug=None, shuffle=False, target_list = range(args.num_labeled_classes))
+        all_eval_loader = CIFAR10Loader(root=args.dataset_root, batch_size=args.batch_size, split='test', aug=None, shuffle=False, target_list = range(num_classes))
     elif args.dataset_name == 'cifar100':
         mix_train_loader = CIFAR100LoaderMix(root=args.dataset_root, batch_size=args.batch_size, split='train', aug='twice', shuffle=True, labeled_list=range(args.num_labeled_classes), unlabeled_list=range(args.num_labeled_classes, num_classes))
         unlabeled_eval_loader = CIFAR100Loader(root=args.dataset_root, batch_size=args.batch_size, split='train', aug=None, shuffle=False, target_list = range(args.num_labeled_classes, num_classes))
         unlabeled_eval_loader_test = CIFAR100Loader(root=args.dataset_root, batch_size=args.batch_size, split='test', aug=None, shuffle=False, target_list = range(args.num_labeled_classes, num_classes))
         labeled_eval_loader = CIFAR100Loader(root=args.dataset_root, batch_size=args.batch_size, split='test', aug=None, shuffle=False, target_list = range(args.num_labeled_classes))
+        all_eval_loader = CIFAR100Loader(root=args.dataset_root, batch_size=args.batch_size, split='test', aug=None, shuffle=False, target_list = range(num_classes))
+    elif args.dataset_name == 'tinyimagenet':
+        mix_train_loader = TinyImageNetLoader(batch_size=args.batch_size, num_workers=8, path=args.dataset_root, aug='twice', shuffle=True, class_list = range(args.num_labeled_classes, num_classes), subfolder='train')
+        unlabeled_eval_loader = TinyImageNetLoader(batch_size=args.batch_size, num_workers=8, path=args.dataset_root, aug=None, shuffle=False, class_list = range(args.num_labeled_classes, num_classes), subfolder='train')
+        unlabeled_eval_loader_test = TinyImageNetLoader(batch_size=args.batch_size, num_workers=8, path=args.dataset_root, aug=None, shuffle=False, class_list = range(args.num_labeled_classes, num_classes), subfolder='val')
+        labeled_eval_loader = TinyImageNetLoader(batch_size=args.batch_size, num_workers=8, path=args.dataset_root, aug=None, shuffle=False, class_list = range(args.num_labeled_classes), subfolder='val')
+        all_eval_loader = TinyImageNetLoader(batch_size=args.batch_size, num_workers=8, path=args.dataset_root, aug=None, shuffle=False, class_list = range(num_classes), subfolder='val')
 
     ncl_ulb = NCLMemory(512, args.m_size, args.m_t, args.num_unlabeled_classes, args.knn, args.w_pos, args.hard_iter, args.num_hard, args.hard_negative_start).to(device)
     ncl_la = NCLMemory(512, args.m_size, args.m_t, args.num_labeled_classes, args.knn, args.w_pos, args.hard_iter, args.num_hard, args.hard_negative_start).to(device)
 
     if args.mode == 'train':
-        train(model, mix_train_loader, unlabeled_eval_loader, args)
+        train(model, mix_train_loader, unlabeled_eval_loader, labeled_eval_loader, all_eval_loader, args)
         torch.save(model.state_dict(), args.model_dir)
         print("model saved to {}.".format(args.model_dir))
     else:
         print("model loaded from {}.".format(args.model_dir))
         model.load_state_dict(torch.load(args.model_dir))
 
+    # =============================== Final Test ===============================
+    acc_list = []
+
+    print('Head2: test on unlabeled classes')
+    args.head = 'head2'
+    _, ind = fair_test(model, unlabeled_eval_loader, args, return_ind=True)
+
     print('Evaluating on Head1')
     args.head = 'head1'
+
     print('test on labeled classes (test split)')
-    test(model, labeled_eval_loader, args)
+    acc = fair_test(model, labeled_eval_loader, args, cluster=False)
+    acc_list.append(acc)
+
+    print('test on unlabeled classes (test split)')
+    acc = fair_test(model, unlabeled_eval_loader_test, args, cluster=False, ind=ind)
+    acc_list.append(acc)
+
+    print('test on all classes w/o clustering (test split)')
+    acc = fair_test(model, all_eval_loader, args, cluster=False, ind=ind)
+    acc_list.append(acc)
+
+    print('test on all classes w/ clustering (test split)')
+    acc = fair_test(model, all_eval_loader, args, cluster=True)
+    acc_list.append(acc)
 
     print('Evaluating on Head2')
     args.head = 'head2'
+
     print('test on unlabeled classes (train split)')
-    test(model, unlabeled_eval_loader, args)
+    acc = fair_test(model, unlabeled_eval_loader, args)
+    acc_list.append(acc)
+
     print('test on unlabeled classes (test split)')
-    test(model, unlabeled_eval_loader_test, args)
+    acc = fair_test(model, unlabeled_eval_loader_test, args)
+    acc_list.append(acc)
+
+    print('Acc List: Joint Head1->Old, New, All_wo_cluster, All_w_cluster, Head2->Train, Test')
+    print(acc_list)

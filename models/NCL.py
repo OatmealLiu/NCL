@@ -3,7 +3,7 @@ from torch import nn
 import math
 import torch.nn.functional as F
 import numpy as np
-from utils.util import cluster_acc
+from utils.fair_evals import cluster_acc
 
 
 class NCLMemory(nn.Module):
@@ -42,6 +42,7 @@ class NCLMemory(nn.Module):
         batchSize = q.shape[0]
         self.k_no_detach = k
         k = k.detach()
+        # print("q.shape={}\t\tk.shape={}".format(q.shape, k.shape))
         self.epoch = epoch
         self.feat = q
         self.this_labels = labels
@@ -90,6 +91,8 @@ class NCLMemory(nn.Module):
         return loss
 
     def ncl_loss(self, inputs):
+        if len(inputs.shape)==1:
+            return 0
 
         targets = self.smooth_hot(inputs.detach().clone())
 

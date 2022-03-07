@@ -10,32 +10,33 @@ matplotlib.use('agg')
 import seaborn as sns
 from matplotlib import pyplot as plt
 # from scipy.optimize import linear_sum_assignment as linear_assignment
-from sklearn.utils.linear_assignment_ import linear_assignment
+# from sklearn.utils.linear_assignment_ import linear_assignment
+from scipy.optimize import linear_sum_assignment as linear_assignment
 import random
 import os
 import argparse
 #######################################################
 # Evaluate Critiron
 #######################################################
-def cluster_acc(y_true, y_pred):
-    """
-    Calculate clustering accuracy. Require scikit-learn installed
-
-    # Arguments
-        y: true labels, numpy.array with shape `(n_samples,)`
-        y_pred: predicted labels, numpy.array with shape `(n_samples,)`
-
-    # Return
-        accuracy, in [0,1]
-    """
-    y_true = y_true.astype(np.int64)
-    assert y_pred.size == y_true.size
-    D = max(y_pred.max(), y_true.max()) + 1
-    w = np.zeros((D, D), dtype=np.int64)
-    for i in range(y_pred.size):
-        w[y_pred[i], y_true[i]] += 1
-    ind = linear_assignment(w.max() - w)
-    return sum([w[i, j] for i, j in ind]) * 1.0 / y_pred.size
+# def cluster_acc(y_true, y_pred):
+#     """
+#     Calculate clustering accuracy. Require scikit-learn installed
+#
+#     # Arguments
+#         y: true labels, numpy.array with shape `(n_samples,)`
+#         y_pred: predicted labels, numpy.array with shape `(n_samples,)`
+#
+#     # Return
+#         accuracy, in [0,1]
+#     """
+#     y_true = y_true.astype(np.int64)
+#     assert y_pred.size == y_true.size
+#     D = max(y_pred.max(), y_true.max()) + 1
+#     w = np.zeros((D, D), dtype=np.int64)
+#     for i in range(y_pred.size):
+#         w[y_pred[i], y_true[i]] += 1
+#     ind = linear_assignment(w.max() - w)
+#     return sum([w[i, j] for i, j in ind]) * 1.0 / y_pred.size
 
 class AverageMeter(object):
     """Computes and stores the average and current value"""
@@ -64,7 +65,7 @@ class BCE(nn.Module):
     eps = 1e-7 # Avoid calculating log(0). Use the small value of float16.
     def forward(self, prob1, prob2, simi):
         # simi: 1->similar; -1->dissimilar; 0->unknown(ignore)
-        assert len(prob1)==len(prob2)==len(simi), 'Wrong input size:{0},{1},{2}'.format(str(len(prob1)),str(len(prob2)),str(len(simi)))
+        # assert len(prob1)==len(prob2)==len(simi), 'Wrong input size:{0},{1},{2}'.format(str(len(prob1)),str(len(prob2)),str(len(simi)))
         P = prob1.mul_(prob2)
         P = P.sum(1)
         P.mul_(simi).add_(simi.eq(-1).type_as(P))
