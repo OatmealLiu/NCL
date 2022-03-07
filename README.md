@@ -30,9 +30,3 @@ sbatch -p gpupart -c 4  --gres gpu:1 ./scripts/ncl_sl_tinyimagenet.sh
 sbatch -p gpupart -c 4  --gres gpu:1 ./ablation_two_scripts/auto_cifar100_two_step.sh
 sbatch -p gpupart -c 4  --gres gpu:1 ./ablation_two_scripts/auto_tiny_two_step.sh
 ```
-scp -r ablation_two_scripts zhun@todi.disi.unitn.it:/data/zhun/NCL
-scp two_NCL_incd_train_cifar100.py zhun@todi.disi.unitn.it:/data/zhun/NCL
-scp two_NCL_incd_train_tinyimagenet.py zhun@todi.disi.unitn.it:/data/zhun/NCL
-
-scp resnet.py zhun@todi.disi.unitn.it:/data/zhun/NCL/models/
-scp fair_evals.py zhun@todi.disi.unitn.it:/data/zhun/NCL/utils/
